@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.6 - 2026-09-12
+
+- Fixed the release workflow's crates.io version lookup to use the sparse
+  index and continue publishing when the requested version is absent.
+
 ## 0.2.5 - 2026-09-12
 
 - Preserved TILE interleave validation when older GDAL versions report the
