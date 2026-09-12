@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4 - 2026-09-12
+
+- Avoided false cross-band ordering errors for valid datasets with
+  per-dataset masks while retaining recursive mask validation.
+
 ## 0.2.3 - 2026-09-12
 
 - Fixed sparse COG block handling, narrow-image overviews, external masks,

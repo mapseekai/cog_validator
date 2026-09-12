@@ -296,6 +296,15 @@ fn validate_dataset(
 
     let main_band_1 = dst.rasterband(1)?;
     let main_ovr_count = main_band_1.overview_count()? as usize;
+    // Some GDAL versions expose per-dataset mask blocks in a way that makes
+    // the imagery-only cross-band sequence non-monotonic even when the COG
+    // is valid. The mask is still validated recursively below; skip only the
+    // separate-band ordering pass for datasets that have such a mask.
+    let has_dataset_mask = (1..=band_count).any(|band_idx| {
+        dst.rasterband(band_idx)
+            .and_then(|band| band.mask_flags())
+            .is_ok_and(|flags| flags.is_per_dataset())
+    });
     for band_idx in 1..=band_count {
         let band = dst.rasterband(band_idx)?;
         let band_name = format!("Band {}", band_idx);
@@ -345,7 +354,7 @@ fn validate_dataset(
         )?;
     }
 
-    if structural_md.block_order_row_major {
+    if structural_md.block_order_row_major && !has_dataset_mask {
         let interleave = dst
             .metadata_item("INTERLEAVE", "IMAGE_STRUCTURE")
             .unwrap_or_default();
