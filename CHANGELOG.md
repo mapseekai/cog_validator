@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5 - 2026-09-12
+
+- Preserved TILE interleave validation when older GDAL versions report the
+  layout as BAND.
+
 ## 0.2.4 - 2026-09-12
 
 - Avoided false cross-band ordering errors for valid datasets with

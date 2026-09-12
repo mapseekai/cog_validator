@@ -387,6 +387,36 @@ fn check_interleave_ordering(
             }
         })
         .collect::<Result<Vec<_>, GdalError>>()?;
+    // Older GDAL releases can expose a TILE-written TIFF as INTERLEAVE=BAND.
+    // Infer the physical order from the first two spatial blocks when the
+    // metadata says BAND, while retaining explicit TILE metadata as decisive.
+    let mut tile_order = interleave == "TILE";
+    if !tile_order {
+        let (block_width, block_height) = bands[0].block_size();
+        let xblocks = bands[0].x_size().div_ceil(block_width);
+        let yblocks = bands[0].y_size().div_ceil(block_height);
+        let next = if xblocks > 1 {
+            Some((1, 0))
+        } else if yblocks > 1 {
+            Some((0, 1))
+        } else {
+            None
+        };
+        if let Some((next_x, next_y)) = next {
+            let first_band_first =
+                read_optional_block_u64(&bands[0], key_buf, "BLOCK_OFFSET_", 0, 0)?.unwrap_or(0);
+            let first_band_next =
+                read_optional_block_u64(&bands[0], key_buf, "BLOCK_OFFSET_", next_x, next_y)?
+                    .unwrap_or(0);
+            let second_band_first =
+                read_optional_block_u64(&bands[1], key_buf, "BLOCK_OFFSET_", 0, 0)?.unwrap_or(0);
+            tile_order = first_band_first != 0
+                && first_band_next != 0
+                && second_band_first != 0
+                && second_band_first < first_band_next;
+        }
+    }
+
     let mut last_offset = 0;
     let mut check_block = |index: usize, x, y| -> Result<(), ValidateCOGError> {
         let offset =
@@ -403,7 +433,7 @@ fn check_interleave_ordering(
         }
         Ok(())
     };
-    if interleave == "BAND" {
+    if !tile_order {
         for (index, band) in bands.iter().enumerate() {
             let (width, height) = band.block_size();
             for y in 0..band.y_size().div_ceil(height) {
