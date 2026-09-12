@@ -26,21 +26,20 @@ The validation logic mirrors [rouault/cog_validator](https://github.com/rouault/
 - `KNOWN_INCOMPATIBLE_EDITION=YES` is rejected.
 
 ### Image structure metadata
-- `LAYOUT=COG` is required (configurable, downgradable to warning).
-- `COMPRESSION` must be one of: `LZW`, `DEFLATE`, `ZSTD`, `LERC`, `LERC_DEFLATE`, `LERC_ZSTD`, `WEBP`, `JPEG`, `JXL`, `PACKBITS`, `CCITTFAX4`.
-- `INTERLEAVE` must be `BAND`, `PIXEL`, or `TILE`.
-- Georeferencing (projection + geotransform) is required (configurable).
+- Optional strict checks can require `LAYOUT=COG` and georeferencing (projection + geotransform). Both checks are disabled by default; disabling them does not emit warnings.
+- An optional compression restriction accepts `LZW`, `DEFLATE`, `ZSTD`, `LERC`, `LERC_DEFLATE`, `LERC_ZSTD`, `WEBP`, `JPEG`, `YCbCr JPEG`, `JXL`, `PACKBITS`, and `CCITTFAX4`.
+- An optional interleave restriction accepts `BAND`, `PIXEL`, and `TILE`.
 
 ### Main image / bands
-- Images larger than 512 px in either dimension must be tiled.
-- Tile dimensions must be multiples of 16.
+- For images larger than 512 px in either dimension, the default reference-compatible strip check rejects a block width equal to the image width when that width exceeds 1024. A stricter tiling check is available as an option.
+- Requiring tile dimensions to be multiples of 16 is opt-in.
 - Large images without internal overviews produce a warning (configurable to error).
 
 ### Overviews
-- Overview dimensions must strictly decrease as the level index increases.
-- Overview reduction factor (in both x and y) must strictly increase as the level index increases.
-- Overview IFD offsets must be in increasing order.
-- Each overview must be tiled.
+- Overview dimensions must decrease as the level index increases; a dimension that has reached 1 may stay at 1 while the other decreases.
+- Overview reduction factors must increase in dimensions that have not reached 1.
+- Overview IFD offsets must be non-decreasing.
+- Overviews use the reference-compatible strip check described above.
 - First data block of the smallest overview must be after its own IFD.
 - For multi-overview files: data block of overview `i` must be after data block of overview `i+1` (smallest overview is written first).
 - First data block of the main image must be after the first data block of overview 0 (largest overview).
@@ -49,9 +48,11 @@ The validation logic mirrors [rouault/cog_validator](https://github.com/rouault/
 - `BLOCK_LEADER=SIZE_AS_UINT4`: the uint32 leader preceding each block must match its byte count.
 - `BLOCK_TRAILER=LAST_4_BYTES_REPEATED`: the last 4 bytes of each block must be repeated as the trailing 4 bytes.
 - `BLOCK_ORDER=ROW_MAJOR`: block offsets within a band must be non-decreasing in row-major order.
+- For separate bands, ordering also follows `BAND` or `TILE` interleaving across bands, including overviews.
+- Sparse blocks with omitted/zero offsets and sizes are supported. File-level ordering uses the first nonempty block.
 
 ### Mask bands
-- Per-dataset mask bands are recursively validated.
+- Internal per-dataset masks on the main image and overviews are validated. External `.msk` files are excluded from main-file block checks.
 - When `MASK_INTERLEAVED_WITH_IMAGERY=YES`:
   - Mask block size must match the imagery band block size.
   - For each block, `mask_offset == imagery_offset + byte_count + leader_pad + trailer_pad`.
@@ -152,16 +153,23 @@ use cog_validator::validator::ValidationOptions;
 
 let options = ValidationOptions {
     require_cog_layout: true,                          // require LAYOUT=COG
-    require_georeferencing: false,                     // downgrade to warning
+    require_georeferencing: false,                     // skip georeferencing checks
     require_internal_overviews_for_large_images: true, // promote to error
+    ..ValidationOptions::default()
 };
 ```
 
 | Option | Default | Effect |
 |---|---|---|
-| `require_cog_layout` | `true` | Missing `LAYOUT=COG` is an error (otherwise warning). |
-| `require_georeferencing` | `true` | Missing projection or geotransform is an error (otherwise warning). |
+| `require_cog_layout` | `false` | When enabled, missing `LAYOUT=COG` is an error; otherwise the check is skipped. |
+| `require_georeferencing` | `false` | When enabled, missing projection or geotransform is an error; otherwise the check is skipped. |
 | `require_internal_overviews_for_large_images` | `false` | When `true`, large image without overviews is an error instead of a warning. |
+| `require_tile_dimension_multiple_of_16` | `false` | Require main-image block dimensions to be multiples of 16. |
+| `strict_tiled_detection` | `false` | For large main images, reject any block dimension equal to its image dimension. |
+| `restrict_compression_to_cog_list` | `false` | Restrict compression to the list above. |
+| `restrict_interleave_to_cog_list` | `false` | Restrict interleave to `BAND`, `PIXEL`, or `TILE`. |
+
+The boolean API returns `Ok(true)` on success and `Err(...)` on failure; it does not return `Ok(false)`. Use the detailed API to retain warnings. Validation scans blocks, so remote validation can involve many range reads; GDAL's VSI cache and range coalescing determine the actual HTTP request count.
 
 ## License
 

@@ -19,7 +19,7 @@ pub fn cog_validator_with_options<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
-    //! End-to-end tests against the bundled COG corpus under `data/`.
+    //! End-to-end tests against the bundled COG corpus under `fixtures/`.
     //!
     //! Expected behavior mirrors `rouault/cog_validator` (the GDAL reference
     //! Python validator). Files in the `VALID` set must validate without
@@ -138,9 +138,71 @@ mod tests {
     }
 
     #[test]
+    fn sparse_cog_blocks_are_valid() {
+        for name in ["sparse", "sparse_mixed", "sparse_mask"] {
+            let report = cog_validator_with_options(
+                data_path(&format!("regressions/{name}.tif")),
+                ValidationOptions::default(),
+            )
+            .unwrap();
+            assert!(report.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn narrow_cog_overviews_are_valid() {
+        cog_validator(data_path("regressions/narrow.tif")).unwrap();
+        cog_validator(data_path("regressions/narrow_vertical.tif")).unwrap();
+    }
+
+    #[test]
+    fn external_mask_offsets_are_not_read_from_main_tiff() {
+        for name in ["baseline", "band_mask", "pixel_mask", "tile_mask"] {
+            cog_validator(data_path(&format!("regressions/{name}.tif"))).unwrap();
+        }
+        cog_validator(data_path("regressions/external_mask.tif")).unwrap();
+    }
+
+    #[test]
+    fn band_interleave_rejects_reordered_bands() {
+        for stem in ["order_band", "order_band_overview"] {
+            cog_validator(data_path(&format!("regressions/{stem}_valid.tif"))).unwrap();
+            let error =
+                cog_validator(data_path(&format!("regressions/{stem}_swapped.tif"))).unwrap_err();
+            assert!(
+                matches!(error, ValidateCOGError::BlockOffsetError { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn tile_interleave_rejects_reordered_bands() {
+        cog_validator(data_path("regressions/order_tile_valid.tif")).unwrap();
+        let error = cog_validator(data_path("regressions/order_tile_swapped.tif")).unwrap_err();
+        assert!(
+            matches!(error, ValidateCOGError::BlockOffsetError { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tiny_block_leader_is_checked() {
+        for stem in ["tiny", "tiny_4", "tiny_5"] {
+            cog_validator(data_path(&format!("regressions/{stem}_valid.tif"))).unwrap();
+            let error = cog_validator(data_path(&format!("regressions/{stem}_bad_leader.tif")))
+                .unwrap_err();
+            assert!(
+                matches!(error, ValidateCOGError::LeaderSizeError { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires external network access"]
     fn cog_validator_from_http() {
         let url = "/vsicurl/https://oin-hotosm.s3.amazonaws.com/59c66c5223c8440011d7b1e4/0/7ad397c0-bba2-4f98-a08a-931ec3a6e943.tif";
-        let _ = cog_validator(url);
+        assert!(cog_validator(url).expect("HTTP COG should validate"));
     }
 }

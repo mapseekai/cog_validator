@@ -291,6 +291,8 @@ fn validate_dataset(
 
     let file_list = collect_file_list(dst)?;
     check_external_ovr(&file_list)?;
+    let external_mask_path = format!("{}.msk", dst.description()?);
+    let has_external_mask = file_list.iter().any(|name| name == &external_mask_path);
 
     let main_band_1 = dst.rasterband(1)?;
     let main_ovr_count = main_band_1.overview_count()? as usize;
@@ -314,14 +316,14 @@ fn validate_dataset(
     for band_idx in 1..=band_count {
         let band = dst.rasterband(band_idx)?;
         let band_name = format!("Band {}", band_idx);
-        let band_ovr_count = band.overview_count()? as usize;
-
-        let interleaved_mask =
-            if structural_md.mask_interleaved_with_imagery && band.mask_flags()?.is_per_dataset() {
-                Some(band.open_mask_band()?)
-            } else {
-                None
-            };
+        let interleaved_mask = if !has_external_mask
+            && structural_md.mask_interleaved_with_imagery
+            && band.mask_flags()?.is_per_dataset()
+        {
+            Some(band.open_mask_band()?)
+        } else {
+            None
+        };
         validate_band(
             &f,
             &band_name,
@@ -330,17 +332,88 @@ fn validate_dataset(
             interleaved_mask.as_ref(),
             &mut key_buf,
         )?;
-        validate_mask_band(&f, &band_name, &band, &structural_md, &mut key_buf)?;
+        if !has_external_mask {
+            validate_mask_band(&f, &band_name, &band, &structural_md, &mut key_buf)?;
+        }
         validate_overviews(
             &f,
             &band,
-            band_ovr_count,
             &band_name,
             &structural_md,
+            has_external_mask,
             &mut key_buf,
         )?;
     }
 
+    if structural_md.block_order_row_major {
+        let interleave = dst
+            .metadata_item("INTERLEAVE", "IMAGE_STRUCTURE")
+            .unwrap_or_default();
+        check_interleave_ordering(dst, None, &interleave, &mut key_buf)?;
+        for level in 0..main_ovr_count {
+            check_interleave_ordering(dst, Some(level), &interleave, &mut key_buf)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check the physical order across separate bands, at one resolution.
+/// Per-band validation alone cannot distinguish BAND from TILE layouts.
+fn check_interleave_ordering(
+    dst: &Dataset,
+    overview: Option<usize>,
+    interleave: &str,
+    key_buf: &mut String,
+) -> Result<(), ValidateCOGError> {
+    if dst.raster_count() < 2 || !matches!(interleave, "BAND" | "TILE") {
+        return Ok(());
+    }
+    let bands = (1..=dst.raster_count())
+        .map(|index| {
+            let band = dst.rasterband(index)?;
+            match overview {
+                Some(level) => band.overview(level),
+                None => Ok(band),
+            }
+        })
+        .collect::<Result<Vec<_>, GdalError>>()?;
+    let mut last_offset = 0;
+    let mut check_block = |index: usize, x, y| -> Result<(), ValidateCOGError> {
+        let offset =
+            read_optional_block_u64(&bands[index], key_buf, "BLOCK_OFFSET_", x, y)?.unwrap_or(0);
+        if offset != 0 {
+            if offset < last_offset {
+                let band_name = match overview {
+                    Some(level) => format!("Band {} overview_{}", index + 1, level),
+                    None => format!("Band {}", index + 1),
+                };
+                return Err(ValidateCOGError::BlockOffsetError { band_name, x, y });
+            }
+            last_offset = offset;
+        }
+        Ok(())
+    };
+    if interleave == "BAND" {
+        for (index, band) in bands.iter().enumerate() {
+            let (width, height) = band.block_size();
+            for y in 0..band.y_size().div_ceil(height) {
+                for x in 0..band.x_size().div_ceil(width) {
+                    check_block(index, x, y)?;
+                }
+            }
+        }
+    } else {
+        let band = &bands[0];
+        let (width, height) = band.block_size();
+        for y in 0..band.y_size().div_ceil(height) {
+            for x in 0..band.x_size().div_ceil(width) {
+                for index in 0..bands.len() {
+                    check_block(index, x, y)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -694,8 +767,28 @@ fn validate_block(
     interleaved_mask: Option<&RasterBand>,
     key_buf: &mut String,
 ) -> Result<(u64, u64), ValidateCOGError> {
-    let offset = read_block_u64(band, key_buf, "BLOCK_OFFSET_", x, y, MetaKind::Offset)?;
-    let byte_count = read_block_u64(band, key_buf, "BLOCK_SIZE_", x, y, MetaKind::Size)?;
+    let offset = read_optional_block_u64(band, key_buf, "BLOCK_OFFSET_", x, y)?.unwrap_or(0);
+    let byte_count = read_optional_block_u64(band, key_buf, "BLOCK_SIZE_", x, y)?;
+
+    // GDAL omits offset/size metadata for sparse tiles. Do not lose the
+    // previous nonempty block's ordering state when crossing an empty tile.
+    if offset == 0 && byte_count.unwrap_or(0) == 0 {
+        if let Some(mask) = interleaved_mask {
+            let mask_offset =
+                read_optional_block_u64(mask, key_buf, "BLOCK_OFFSET_", x, y)?.unwrap_or(0);
+            if mask_offset != 0 {
+                if md.block_order_row_major && mask_offset < last_offset {
+                    return Err(ValidateCOGError::BlockOffsetError {
+                        band_name: format!("Mask of {band_name}"),
+                        x,
+                        y,
+                    });
+                }
+                return Ok((mask_offset, last_end));
+            }
+        }
+        return Ok((last_offset, last_end));
+    }
 
     if offset == 0 {
         return Err(ValidateCOGError::ZeroBlockOffsetError {
@@ -704,6 +797,7 @@ fn validate_block(
             y,
         });
     }
+    let byte_count = byte_count.ok_or(ValidateCOGError::MissingBlockSizeMetadata { x, y })?;
 
     if md.block_order_row_major && offset < last_offset {
         return Err(ValidateCOGError::BlockOffsetError {
@@ -723,7 +817,7 @@ fn validate_block(
         });
     }
 
-    if md.block_leader_size_as_uint4 && byte_count > 4 {
+    if md.block_leader_size_as_uint4 {
         check_leader_size(f, band_name, x, y, offset, byte_count)?;
     }
     if md.block_trailer_last_4_bytes_repeated {
@@ -773,31 +867,6 @@ fn validate_block(
     Ok((offset, next_last_end))
 }
 
-enum MetaKind {
-    Offset,
-    Size,
-}
-
-/// Reads a required `<prefix><x>_<y>` TIFF metadata item as `u64`, reusing
-/// `key_buf` to avoid per-block allocations.
-fn read_block_u64(
-    band: &RasterBand,
-    key_buf: &mut String,
-    prefix: &str,
-    x: usize,
-    y: usize,
-    kind: MetaKind,
-) -> Result<u64, ValidateCOGError> {
-    write_block_key(key_buf, prefix, x, y);
-    let value = band
-        .metadata_item(key_buf.as_str(), "TIFF")
-        .ok_or(match kind {
-            MetaKind::Offset => ValidateCOGError::MissingBlockOffsetMetadata { x, y },
-            MetaKind::Size => ValidateCOGError::MissingBlockSizeMetadata { x, y },
-        })?;
-    parse_metadata_u64(key_buf, &value, x, y)
-}
-
 /// Optional variant: returns `None` if the metadata item is absent.
 fn read_optional_block_u64(
     band: &RasterBand,
@@ -827,9 +896,6 @@ fn check_leader_size(
     offset: u64,
     byte_count: u64,
 ) -> Result<(), ValidateCOGError> {
-    if byte_count <= 4 {
-        return Ok(());
-    }
     let mut buf = [0u8; 4];
     let leader_offset = block_leader_offset(offset)?;
     f.read_exact_at(&mut buf, leader_offset, Whence::SeekSet)?;
@@ -888,20 +954,23 @@ fn validate_mask_band(
 fn validate_overviews(
     f: &VSIFile,
     band: &RasterBand,
-    ovr_count: usize,
     band_name: &str,
     md: &StructuralMetadata,
+    has_external_mask: bool,
     key_buf: &mut String,
 ) -> Result<(), ValidateCOGError> {
+    let ovr_count = band.overview_count()? as usize;
     for level in 0..ovr_count {
         let ovr_band = band.overview(level)?;
         let ovr_name = format!("{} overview_{}", band_name, level);
-        let interleaved_mask =
-            if md.mask_interleaved_with_imagery && ovr_band.mask_flags()?.is_per_dataset() {
-                Some(ovr_band.open_mask_band()?)
-            } else {
-                None
-            };
+        let interleaved_mask = if !has_external_mask
+            && md.mask_interleaved_with_imagery
+            && ovr_band.mask_flags()?.is_per_dataset()
+        {
+            Some(ovr_band.open_mask_band()?)
+        } else {
+            None
+        };
         validate_band(
             f,
             &ovr_name,
@@ -910,7 +979,9 @@ fn validate_overviews(
             interleaved_mask.as_ref(),
             key_buf,
         )?;
-        validate_mask_band(f, &ovr_name, &ovr_band, md, key_buf)?;
+        if !has_external_mask {
+            validate_mask_band(f, &ovr_name, &ovr_band, md, key_buf)?;
+        }
     }
     Ok(())
 }
@@ -928,11 +999,20 @@ fn check_band_overview_dimensions(
 }
 
 fn first_block_offset(band: &RasterBand) -> Result<Option<u64>, ValidateCOGError> {
-    let offset_key = "BLOCK_OFFSET_0_0";
-    match band.metadata_item(offset_key, "TIFF") {
-        Some(v) => Ok(Some(parse_metadata_u64(offset_key, &v, 0, 0)?)),
-        None => Ok(None),
+    let (width, height) = band.block_size();
+    let mut key_buf = String::with_capacity(48);
+    for y in 0..band.y_size().div_ceil(height) {
+        for x in 0..band.x_size().div_ceil(width) {
+            if let Some(offset) =
+                read_optional_block_u64(band, &mut key_buf, "BLOCK_OFFSET_", x, y)?
+            {
+                if offset != 0 {
+                    return Ok(Some(offset));
+                }
+            }
+        }
     }
+    Ok(None)
 }
 
 fn check_image_structure(
@@ -989,7 +1069,12 @@ fn check_overview_dimensions(
     let mut prev_factor_y = 1.0_f64;
 
     for (level, (width, height)) in overviews.iter().copied().enumerate() {
-        if width == 0 || height == 0 || width >= prev_dimensions.0 || height >= prev_dimensions.1 {
+        if width == 0
+            || height == 0
+            || (width, height) == prev_dimensions
+            || (width >= prev_dimensions.0 && width != 1)
+            || (height >= prev_dimensions.1 && height != 1)
+        {
             return Err(ValidateCOGError::InvalidOverviewDimensions {
                 level,
                 prev_width: prev_dimensions.0,
@@ -1001,7 +1086,7 @@ fn check_overview_dimensions(
 
         let factor_x = main_dimensions.0 as f64 / width as f64;
         let factor_y = main_dimensions.1 as f64 / height as f64;
-        if factor_x <= prev_factor_x || factor_y <= prev_factor_y {
+        if (width > 1 && factor_x <= prev_factor_x) || (height > 1 && factor_y <= prev_factor_y) {
             return Err(ValidateCOGError::InvalidOverviewReductionFactor {
                 level,
                 prev_factor_x,
@@ -1083,7 +1168,8 @@ where
     for i in 0..MAX_C_STRING_ARRAY_LEN {
         // SAFETY: GDAL CSLs are null-terminated arrays of valid C string
         // pointers. We stop at the first null, and `MAX_C_STRING_ARRAY_LEN`
-        // bounds the walk so a missing terminator can't cause OOB.
+        // limits the work; validity and termination are guaranteed by GDAL,
+        // not by this limit (which cannot prove the allocation's length).
         let next = unsafe { raw_ptr.add(i).read() };
         if next.is_null() {
             return Ok(ret_val);

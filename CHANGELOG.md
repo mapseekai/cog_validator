@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 - 2026-09-12
+
+- Fixed sparse COG block handling, narrow-image overviews, external masks,
+  cross-band ordering, and small-block leader validation.
+- Added regression fixtures and tests for these validation cases.
+- Corrected README validation defaults and aligned the package license with
+  the Apache-2.0 license file.
+
 ## 0.2.2 - 2026-06-01
 
 - Removed oversized local COG fixtures from Git tracking.
